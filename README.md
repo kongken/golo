@@ -1,10 +1,11 @@
 # golo
 
-`golo` is a Go rewrite of the core Polr URL shortener flow.
+`golo` is a Go rewrite of the core Polr URL shortener flow built on Butterfly Core.
 
 It includes:
 
 - Web UI for shortening links
+- Butterfly Core app lifecycle and Gin route integration
 - Redirects for public and secret links
 - SQLite-backed storage with automatic schema creation
 - Polr-style `api/v2` endpoints for shorten, bulk shorten, lookup, and basic analytics
@@ -15,12 +16,15 @@ It includes:
 go run .
 ```
 
-Environment variables:
+By default the app boots through Butterfly Core using the checked-in file config at `config/golo.yaml`.
 
-- `PORT`: listen port, default `8080`
-- `BASE_URL`: public base URL, defaults to the incoming request host
-- `DATABASE_PATH`: sqlite database path, default `golo.db`
-- `API_KEY`: optional shared API key for `/api/v2` endpoints
+Relevant settings:
+
+- `BUTTERFLY_CONFIG_FILE_PATH`: override the Butterfly config file path
+- `BUTTERFLY_TRACING_DISABLE=true`: enabled by default in `main.go` for local runs
+- `base_url`: public base URL in `config/golo.yaml`, defaults to the incoming request host when empty
+- `database_path`: sqlite database path in `config/golo.yaml`
+- `api_key`: optional shared API key for `/api/v2` endpoints in `config/golo.yaml`
 
 ## API Compatibility
 

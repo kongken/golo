@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	_ "modernc.org/sqlite"
 )
 
@@ -22,11 +23,20 @@ func newTestApp(t *testing.T) *app {
 	if err := initSchema(db); err != nil {
 		t.Fatalf("init schema: %v", err)
 	}
-	return &app{db: db, config: config{baseURL: "http://short.test", apiKey: "secret-api-key"}}
+	return &app{db: db, config: appConfig{BaseURL: "http://short.test", APIKey: "secret-api-key"}}
+}
+
+func newTestRouter(t *testing.T) (*app, *gin.Engine) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	a := newTestApp(t)
+	r := gin.New()
+	a.registerRoutes(r)
+	return a, r
 }
 
 func TestShortenAndRedirect(t *testing.T) {
-	a := newTestApp(t)
+	a, r := newTestRouter(t)
 
 	form := url.Values{}
 	form.Set("link-url", "https://example.com/hello")
@@ -34,7 +44,7 @@ func TestShortenAndRedirect(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/shorten", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	res := httptest.NewRecorder()
-	a.ServeHTTP(res, req)
+	r.ServeHTTP(res, req)
 
 	if res.Code != http.StatusOK {
 		t.Fatalf("shorten status = %d", res.Code)
@@ -46,7 +56,7 @@ func TestShortenAndRedirect(t *testing.T) {
 	redirectReq := httptest.NewRequest(http.MethodGet, "/hello", nil)
 	redirectReq.Header.Set("Referer", "https://ref.example")
 	redirectRes := httptest.NewRecorder()
-	a.ServeHTTP(redirectRes, redirectReq)
+	r.ServeHTTP(redirectRes, redirectReq)
 
 	if redirectRes.Code != http.StatusMovedPermanently {
 		t.Fatalf("redirect status = %d", redirectRes.Code)
@@ -64,11 +74,11 @@ func TestShortenAndRedirect(t *testing.T) {
 }
 
 func TestAPIShortenLookupAndStats(t *testing.T) {
-	a := newTestApp(t)
+	_, r := newTestRouter(t)
 
 	shortenReq := httptest.NewRequest(http.MethodGet, "/api/v2/action/shorten?key=secret-api-key&url=https://example.com/docs&custom_ending=docs", nil)
 	shortenRes := httptest.NewRecorder()
-	a.ServeHTTP(shortenRes, shortenReq)
+	r.ServeHTTP(shortenRes, shortenReq)
 	if shortenRes.Code != http.StatusOK {
 		t.Fatalf("shorten status = %d body=%s", shortenRes.Code, shortenRes.Body.String())
 	}
@@ -76,11 +86,11 @@ func TestAPIShortenLookupAndStats(t *testing.T) {
 	redirectReq := httptest.NewRequest(http.MethodGet, "/docs", nil)
 	redirectReq.Header.Set("Referer", "https://news.ycombinator.com")
 	redirectRes := httptest.NewRecorder()
-	a.ServeHTTP(redirectRes, redirectReq)
+	r.ServeHTTP(redirectRes, redirectReq)
 
 	lookupReq := httptest.NewRequest(http.MethodGet, "/api/v2/action/lookup?key=secret-api-key&url_ending=docs", nil)
 	lookupRes := httptest.NewRecorder()
-	a.ServeHTTP(lookupRes, lookupReq)
+	r.ServeHTTP(lookupRes, lookupReq)
 	if lookupRes.Code != http.StatusOK {
 		t.Fatalf("lookup status = %d body=%s", lookupRes.Code, lookupRes.Body.String())
 	}
@@ -94,7 +104,7 @@ func TestAPIShortenLookupAndStats(t *testing.T) {
 
 	statsReq := httptest.NewRequest(http.MethodGet, "/api/v2/data/link?key=secret-api-key&url_ending=docs&stats_type=referer", nil)
 	statsRes := httptest.NewRecorder()
-	a.ServeHTTP(statsRes, statsReq)
+	r.ServeHTTP(statsRes, statsReq)
 	if statsRes.Code != http.StatusOK {
 		t.Fatalf("stats status = %d body=%s", statsRes.Code, statsRes.Body.String())
 	}

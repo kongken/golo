@@ -1,0 +1,6 @@
+base_url: ""
+database_path: golo.db
+api_key: ""
+
+log:
+  level: error

@@ -9,14 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"log"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	core "butterfly.orx.me/core"
+	butterflyapp "butterfly.orx.me/core/app"
+	"github.com/gin-gonic/gin"
 	_ "modernc.org/sqlite"
 )
 
@@ -61,16 +64,17 @@ const indexHTML = `<!DOCTYPE html>
 
 var indexTemplate = template.Must(template.New("index").Parse(indexHTML))
 
-type config struct {
-	port         string
-	baseURL      string
-	databasePath string
-	apiKey       string
+type appConfig struct {
+	BaseURL      string `yaml:"base_url"`
+	DatabasePath string `yaml:"database_path"`
+	APIKey       string `yaml:"api_key"`
 }
+
+func (c *appConfig) Print() {}
 
 type app struct {
 	db     *sql.DB
-	config config
+	config appConfig
 }
 
 type link struct {
@@ -91,116 +95,118 @@ type indexData struct {
 }
 
 func main() {
-	cfg := config{
-		port:         envOrDefault("PORT", "8080"),
-		baseURL:      strings.TrimRight(os.Getenv("BASE_URL"), "/"),
-		databasePath: envOrDefault("DATABASE_PATH", "golo.db"),
-		apiKey:       os.Getenv("API_KEY"),
-	}
+	bootstrapButterflyEnv()
 
-	db, err := sql.Open("sqlite", cfg.databasePath)
+	application := &app{}
+	service := core.New(&butterflyapp.Config{
+		Service: "golo",
+		Config:  &application.config,
+		Router:  application.registerRoutes,
+		InitFunc: []func() error{
+			application.initStorage,
+		},
+	})
+	service.Run()
+}
+
+func bootstrapButterflyEnv() {
+	if os.Getenv("BUTTERFLY_CONFIG_TYPE") == "" {
+		_ = os.Setenv("BUTTERFLY_CONFIG_TYPE", "file")
+	}
+	if os.Getenv("BUTTERFLY_CONFIG_FILE_PATH") == "" {
+		wd, err := os.Getwd()
+		if err == nil {
+			_ = os.Setenv("BUTTERFLY_CONFIG_FILE_PATH", filepath.Join(wd, "config", "golo.yaml"))
+		}
+	}
+	if os.Getenv("BUTTERFLY_TRACING_DISABLE") == "" {
+		_ = os.Setenv("BUTTERFLY_TRACING_DISABLE", "true")
+	}
+}
+
+func (a *app) initStorage() error {
+	path := a.config.DatabasePath
+	if path == "" {
+		path = "golo.db"
+	}
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		log.Fatalf("open database: %v", err)
+		return err
 	}
-	defer db.Close()
-
 	if err := initSchema(db); err != nil {
-		log.Fatalf("init schema: %v", err)
+		_ = db.Close()
+		return err
 	}
+	a.db = db
+	return nil
+}
 
-	application := &app{db: db, config: cfg}
-	addr := ":" + cfg.port
-	log.Printf("listening on %s", addr)
-	if err := http.ListenAndServe(addr, application); err != nil {
-		log.Fatal(err)
+func (a *app) registerRoutes(r *gin.Engine) {
+	r.GET("/", a.renderIndex)
+	r.POST("/shorten", a.handleShortenForm)
+
+	api := r.Group("/api/v2")
+	api.GET("/action/shorten", a.handleAPIShorten)
+	api.POST("/action/shorten", a.handleAPIShorten)
+	api.POST("/action/shorten_bulk", a.handleAPIShortenBulk)
+	api.GET("/action/lookup", a.handleAPILookup)
+	api.POST("/action/lookup", a.handleAPILookup)
+	api.GET("/data/link", a.handleAPIDataLink)
+	api.POST("/data/link", a.handleAPIDataLink)
+
+	r.GET("/:code", a.handleRedirect)
+	r.GET("/:code/:secret", a.handleRedirect)
+}
+
+func (a *app) renderIndex(c *gin.Context) {
+	a.renderIndexWithData(c, indexData{})
+}
+
+func (a *app) renderIndexWithData(c *gin.Context, data indexData) {
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Status(http.StatusOK)
+	if err := indexTemplate.Execute(c.Writer, data); err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
 }
 
-func (a *app) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case r.URL.Path == "/" && r.Method == http.MethodGet:
-		a.renderIndex(w, indexData{})
-	case r.URL.Path == "/shorten" && r.Method == http.MethodPost:
-		a.handleShortenForm(w, r)
-	case strings.HasPrefix(r.URL.Path, "/api/v2/"):
-		a.handleAPI(w, r)
-	default:
-		a.handleRedirect(w, r)
-	}
-}
-
-func (a *app) renderIndex(w http.ResponseWriter, data indexData) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := indexTemplate.Execute(w, data); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-func (a *app) handleShortenForm(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		a.renderIndex(w, indexData{Error: "invalid form submission"})
-		return
-	}
-
-	created, err := a.createLink(r.Context(), createLinkInput{
-		LongURL:      r.FormValue("link-url"),
-		CustomEnding: r.FormValue("custom-ending"),
-		Secret:       r.FormValue("options") == "s",
+func (a *app) handleShortenForm(c *gin.Context) {
+	created, err := a.createLink(c.Request.Context(), createLinkInput{
+		LongURL:      c.PostForm("link-url"),
+		CustomEnding: c.PostForm("custom-ending"),
+		Secret:       c.PostForm("options") == "s",
 	})
 	if err != nil {
-		a.renderIndex(w, indexData{Error: err.Error()})
+		a.renderIndexWithData(c, indexData{Error: err.Error()})
 		return
 	}
 
-	a.renderIndex(w, indexData{
-		Result: a.fullShortURL(r, created.Code, created.SecretKey),
+	a.renderIndexWithData(c, indexData{
+		Result: a.fullShortURL(c.Request, created.Code, created.SecretKey),
 		Secret: created.SecretKey,
 	})
 }
 
-func (a *app) handleAPI(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseForm(); err != nil {
-		a.writeAPIError(w, r, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
+func (a *app) handleAPIShorten(c *gin.Context) {
+	if !a.authorizeAPI(c) {
 		return
 	}
 
-	if a.config.apiKey != "" && r.FormValue("key") != a.config.apiKey {
-		a.writeAPIError(w, r, http.StatusUnauthorized, "AUTH_ERROR", "Invalid API key.")
-		return
-	}
-
-	path := strings.TrimPrefix(r.URL.Path, "/api/v2/")
-	switch path {
-	case "action/shorten":
-		a.handleAPIShorten(w, r)
-	case "action/shorten_bulk":
-		a.handleAPIShortenBulk(w, r)
-	case "action/lookup":
-		a.handleAPILookup(w, r)
-	case "data/link":
-		a.handleAPIDataLink(w, r)
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func (a *app) handleAPIShorten(w http.ResponseWriter, r *http.Request) {
-	created, err := a.createLink(r.Context(), createLinkInput{
-		LongURL:      r.FormValue("url"),
-		CustomEnding: r.FormValue("custom_ending"),
-		Secret:       r.FormValue("is_secret") == "true",
+	created, err := a.createLink(c.Request.Context(), createLinkInput{
+		LongURL:      c.Request.FormValue("url"),
+		CustomEnding: c.Request.FormValue("custom_ending"),
+		Secret:       c.Request.FormValue("is_secret") == "true",
 	})
 	if err != nil {
-		a.writeAPIError(w, r, http.StatusBadRequest, "CREATION_ERROR", err.Error())
+		a.writeAPIError(c, http.StatusBadRequest, "CREATION_ERROR", err.Error())
 		return
 	}
 
-	a.writeAPIResponse(w, r, "shorten", a.fullShortURL(r, created.Code, created.SecretKey))
+	a.writeAPIResponse(c, "shorten", a.fullShortURL(c.Request, created.Code, created.SecretKey))
 }
 
-func (a *app) handleAPIShortenBulk(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+func (a *app) handleAPIShortenBulk(c *gin.Context) {
+	if !a.authorizeAPI(c) {
 		return
 	}
 
@@ -211,156 +217,165 @@ func (a *app) handleAPIShortenBulk(w http.ResponseWriter, r *http.Request) {
 			CustomEnding string `json:"custom_ending"`
 		} `json:"links"`
 	}
-	if err := json.Unmarshal([]byte(r.FormValue("data")), &payload); err != nil {
-		a.writeAPIError(w, r, http.StatusBadRequest, "INVALID_PARAMETERS", "Invalid JSON.")
+	if err := json.Unmarshal([]byte(c.PostForm("data")), &payload); err != nil {
+		a.writeAPIError(c, http.StatusBadRequest, "INVALID_PARAMETERS", "Invalid JSON.")
 		return
 	}
 
 	shortened := make([]map[string]string, 0, len(payload.Links))
 	for _, item := range payload.Links {
-		created, err := a.createLink(r.Context(), createLinkInput{
+		created, err := a.createLink(c.Request.Context(), createLinkInput{
 			LongURL:      item.URL,
 			CustomEnding: item.CustomEnding,
 			Secret:       item.IsSecret,
 		})
 		if err != nil {
-			a.writeAPIError(w, r, http.StatusBadRequest, "CREATION_ERROR", err.Error())
+			a.writeAPIError(c, http.StatusBadRequest, "CREATION_ERROR", err.Error())
 			return
 		}
 		shortened = append(shortened, map[string]string{
 			"long_url":  item.URL,
-			"short_url": a.fullShortURL(r, created.Code, created.SecretKey),
+			"short_url": a.fullShortURL(c.Request, created.Code, created.SecretKey),
 		})
 	}
 
-	a.writeJSON(w, http.StatusOK, map[string]any{
+	a.writeJSON(c, http.StatusOK, gin.H{
 		"action": "shorten_bulk",
-		"result": map[string]any{"shortened_links": shortened},
+		"result": gin.H{"shortened_links": shortened},
 	})
 }
 
-func (a *app) handleAPILookup(w http.ResponseWriter, r *http.Request) {
-	code := r.FormValue("url_ending")
-	if !isAlphaDash(code) {
-		a.writeAPIError(w, r, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
+func (a *app) handleAPILookup(c *gin.Context) {
+	if !a.authorizeAPI(c) {
 		return
 	}
 
-	lnk, err := a.findLinkByCode(r.Context(), code)
+	code := c.Request.FormValue("url_ending")
+	if !isAlphaDash(code) {
+		a.writeAPIError(c, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
+		return
+	}
+
+	lnk, err := a.findLinkByCode(c.Request.Context(), code)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			a.writeAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Link not found.")
+			a.writeAPIError(c, http.StatusNotFound, "NOT_FOUND", "Link not found.")
 			return
 		}
-		a.writeAPIError(w, r, http.StatusInternalServerError, "LOOKUP_ERROR", "Unable to load link.")
+		a.writeAPIError(c, http.StatusInternalServerError, "LOOKUP_ERROR", "Unable to load link.")
 		return
 	}
 
-	if lnk.SecretKey != "" && r.FormValue("url_key") != lnk.SecretKey {
-		a.writeAPIError(w, r, http.StatusUnauthorized, "ACCESS_DENIED", "Invalid URL code for secret URL.")
+	if lnk.SecretKey != "" && c.Request.FormValue("url_key") != lnk.SecretKey {
+		a.writeAPIError(c, http.StatusUnauthorized, "ACCESS_DENIED", "Invalid URL code for secret URL.")
 		return
 	}
 
-	result := map[string]any{
+	result := gin.H{
 		"long_url":   lnk.LongURL,
-		"created_at": map[string]any{"date": lnk.CreatedAt.UTC().Format("2006-01-02 15:04:05.000000"), "timezone_type": 3, "timezone": "UTC"},
-		"updated_at": map[string]any{"date": lnk.UpdatedAt.UTC().Format("2006-01-02 15:04:05.000000"), "timezone_type": 3, "timezone": "UTC"},
+		"created_at": gin.H{"date": lnk.CreatedAt.UTC().Format("2006-01-02 15:04:05.000000"), "timezone_type": 3, "timezone": "UTC"},
+		"updated_at": gin.H{"date": lnk.UpdatedAt.UTC().Format("2006-01-02 15:04:05.000000"), "timezone_type": 3, "timezone": "UTC"},
 		"clicks":     fmt.Sprintf("%d", lnk.Clicks),
 	}
 
-	a.writeAPIResponse(w, r, "lookup", result)
+	a.writeAPIResponse(c, "lookup", result)
 }
 
-func (a *app) handleAPIDataLink(w http.ResponseWriter, r *http.Request) {
-	if responseType(r) == "plain_text" {
-		a.writeAPIError(w, r, http.StatusUnauthorized, "JSON_ONLY", "Only JSON-encoded data is available for this endpoint.")
+func (a *app) handleAPIDataLink(c *gin.Context) {
+	if !a.authorizeAPI(c) {
+		return
+	}
+	if responseType(c.Request) == "plain_text" {
+		a.writeAPIError(c, http.StatusUnauthorized, "JSON_ONLY", "Only JSON-encoded data is available for this endpoint.")
 		return
 	}
 
-	code := r.FormValue("url_ending")
-	statsType := r.FormValue("stats_type")
+	code := c.Request.FormValue("url_ending")
+	statsType := c.Request.FormValue("stats_type")
 	if !isAlphaDash(code) || statsType == "" {
-		a.writeAPIError(w, r, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
+		a.writeAPIError(c, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
 		return
 	}
 
-	lnk, err := a.findLinkByCode(r.Context(), code)
+	lnk, err := a.findLinkByCode(c.Request.Context(), code)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			a.writeAPIError(w, r, http.StatusNotFound, "NOT_FOUND", "Link not found.")
+			a.writeAPIError(c, http.StatusNotFound, "NOT_FOUND", "Link not found.")
 			return
 		}
-		a.writeAPIError(w, r, http.StatusInternalServerError, "ANALYTICS_ERROR", "Unable to load link.")
+		a.writeAPIError(c, http.StatusInternalServerError, "ANALYTICS_ERROR", "Unable to load link.")
 		return
 	}
 
-	left, right, err := parseBounds(r.FormValue("left_bound"), r.FormValue("right_bound"))
+	left, right, err := parseBounds(c.Request.FormValue("left_bound"), c.Request.FormValue("right_bound"))
 	if err != nil {
-		a.writeAPIError(w, r, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
+		a.writeAPIError(c, http.StatusBadRequest, "MISSING_PARAMETERS", "Invalid or missing parameters.")
 		return
 	}
 
-	data, err := a.analytics(r.Context(), lnk.ID, statsType, left, right)
+	data, err := a.analytics(c.Request.Context(), lnk.ID, statsType, left, right)
 	if err != nil {
 		status := http.StatusBadRequest
-		code := "INVALID_ANALYTICS_TYPE"
+		errorCode := "INVALID_ANALYTICS_TYPE"
 		if !errors.Is(err, errInvalidAnalyticsType) {
 			status = http.StatusInternalServerError
-			code = "ANALYTICS_ERROR"
+			errorCode = "ANALYTICS_ERROR"
 		}
-		a.writeAPIError(w, r, status, code, err.Error())
+		a.writeAPIError(c, status, errorCode, err.Error())
 		return
 	}
 
-	a.writeJSON(w, http.StatusOK, map[string]any{
+	a.writeJSON(c, http.StatusOK, gin.H{
 		"action": "data_link_" + statsType,
-		"result": map[string]any{
+		"result": gin.H{
 			"url_ending": lnk.Code,
 			"data":       data,
 		},
 	})
 }
 
-func (a *app) handleRedirect(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.NotFound(w, r)
+func (a *app) handleRedirect(c *gin.Context) {
+	code := c.Param("code")
+	if !isAlphaDash(code) {
+		c.Status(http.StatusNotFound)
 		return
 	}
 
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" || len(parts) > 2 {
-		http.NotFound(w, r)
-		return
-	}
-
-	lnk, err := a.findLinkByCode(r.Context(), parts[0])
+	lnk, err := a.findLinkByCode(c.Request.Context(), code)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			http.NotFound(w, r)
+			c.Status(http.StatusNotFound)
 			return
 		}
-		http.Error(w, "lookup failed", http.StatusInternalServerError)
+		c.String(http.StatusInternalServerError, "lookup failed")
 		return
 	}
 
 	if lnk.Disabled {
-		http.Error(w, "link has been disabled", http.StatusForbidden)
+		c.String(http.StatusForbidden, "link has been disabled")
 		return
 	}
 
-	if lnk.SecretKey != "" {
-		if len(parts) != 2 || parts[1] != lnk.SecretKey {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-	}
-
-	if err := a.recordClick(r.Context(), lnk.ID, r.Referer()); err != nil {
-		http.Error(w, "analytics failed", http.StatusInternalServerError)
+	secret := strings.TrimPrefix(c.Param("secret"), "/")
+	if lnk.SecretKey != "" && secret != lnk.SecretKey {
+		c.String(http.StatusForbidden, "forbidden")
 		return
 	}
 
-	http.Redirect(w, r, lnk.LongURL, http.StatusMovedPermanently)
+	if err := a.recordClick(c.Request.Context(), lnk.ID, c.Request.Referer()); err != nil {
+		c.String(http.StatusInternalServerError, "analytics failed")
+		return
+	}
+
+	c.Redirect(http.StatusMovedPermanently, lnk.LongURL)
+}
+
+func (a *app) authorizeAPI(c *gin.Context) bool {
+	if a.config.APIKey != "" && c.Request.FormValue("key") != a.config.APIKey {
+		a.writeAPIError(c, http.StatusUnauthorized, "AUTH_ERROR", "Invalid API key.")
+		return false
+	}
+	return true
 }
 
 type createLinkInput struct {
@@ -525,7 +540,7 @@ func (a *app) analytics(ctx context.Context, linkID int64, statsType string, lef
 }
 
 func (a *app) fullShortURL(r *http.Request, code string, secret string) string {
-	base := a.config.baseURL
+	base := strings.TrimRight(a.config.BaseURL, "/")
 	if base == "" {
 		scheme := "http"
 		if r.TLS != nil {
@@ -539,29 +554,26 @@ func (a *app) fullShortURL(r *http.Request, code string, secret string) string {
 	return base + "/" + code + "/" + secret
 }
 
-func (a *app) writeAPIResponse(w http.ResponseWriter, r *http.Request, action string, result any) {
-	if responseType(r) == "plain_text" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, result)
+func (a *app) writeAPIResponse(c *gin.Context, action string, result any) {
+	if responseType(c.Request) == "plain_text" {
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.String(http.StatusOK, fmt.Sprint(result))
 		return
 	}
-	a.writeJSON(w, http.StatusOK, map[string]any{"action": action, "result": result})
+	a.writeJSON(c, http.StatusOK, gin.H{"action": action, "result": result})
 }
 
-func (a *app) writeAPIError(w http.ResponseWriter, r *http.Request, status int, code string, message string) {
-	if responseType(r) == "plain_text" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(status)
-		fmt.Fprintf(w, "%d %s", status, message)
+func (a *app) writeAPIError(c *gin.Context, status int, code string, message string) {
+	if responseType(c.Request) == "plain_text" {
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.String(status, "%d %s", status, message)
 		return
 	}
-	a.writeJSON(w, status, map[string]any{"status_code": status, "error_code": code, "error": message})
+	a.writeJSON(c, status, gin.H{"status_code": status, "error_code": code, "error": message})
 }
 
-func (a *app) writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
+func (a *app) writeJSON(c *gin.Context, status int, payload any) {
+	c.JSON(status, payload)
 }
 
 func initSchema(db *sql.DB) error {
@@ -663,11 +675,4 @@ func randomHex(bytes int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func envOrDefault(key string, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
 }
